@@ -6,6 +6,7 @@ import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DefaultPackageManager, type ProgressEvent, type ResolvedResource } from "../src/core/package-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import { TrustStore } from "../src/core/trust-store.ts";
 
 function normalizeForMatch(value: string): string {
 	return value.replace(/\\/g, "/");
@@ -62,6 +63,7 @@ describe("DefaultPackageManager", () => {
 			cwd: tempDir,
 			agentDir,
 			settingsManager,
+			trustStore: TrustStore.create(tempDir, agentDir),
 		});
 	});
 
@@ -346,6 +348,7 @@ Content`,
 				cwd: nestedCwd,
 				agentDir,
 				settingsManager,
+				trustStore: TrustStore.create(tempDir, agentDir),
 			});
 
 			const result = await pm.resolve();
@@ -384,6 +387,7 @@ Content`,
 				cwd: nestedCwd,
 				agentDir,
 				settingsManager,
+				trustStore: TrustStore.create(tempDir, agentDir),
 			});
 
 			const result = await pm.resolve();
@@ -409,6 +413,7 @@ Content`,
 				cwd: nestedCwd,
 				agentDir,
 				settingsManager,
+				trustStore: TrustStore.create(tempDir, agentDir),
 			});
 
 			const result = await pm.resolve();
@@ -428,6 +433,7 @@ Content`,
 				cwd: join(tempDir, "work"),
 				agentDir,
 				settingsManager,
+				trustStore: TrustStore.create(tempDir, agentDir),
 			});
 			mkdirSync(join(tempDir, "work"), { recursive: true });
 
@@ -455,6 +461,7 @@ Content`,
 					cwd,
 					agentDir: localAgentDir,
 					settingsManager: localSettingsManager,
+					trustStore: TrustStore.create(tempDir, agentDir),
 				});
 
 				const result = await pm.resolve();
@@ -632,6 +639,50 @@ Content`,
 		});
 	});
 
+	describe("project package trust", () => {
+		it("should report missing untrusted project git packages without installing them", async () => {
+			settingsManager.setProjectPackages(["git:https://github.com/user/repo.git"]);
+			const runCommandCaptureSpy = vi
+				.spyOn(packageManager as any, "runCommandCapture")
+				.mockResolvedValue("0123456789abcdef0123456789abcdef01234567\tHEAD\n");
+			const installParsedSourceSpy = vi.spyOn(packageManager as any, "installParsedSource");
+
+			const result = await packageManager.resolve();
+
+			expect(result.untrustedProjectPackages).toEqual([
+				{
+					source: "git:https://github.com/user/repo.git",
+					artifact: "git:github.com/user/repo@0123456789abcdef0123456789abcdef01234567",
+					reason: "untrusted",
+				},
+			]);
+			expect(installParsedSourceSpy).not.toHaveBeenCalled();
+			expect(runCommandCaptureSpy).toHaveBeenCalledWith(
+				"git",
+				["ls-remote", "https://github.com/user/repo.git", "HEAD"],
+				expect.objectContaining({ cwd: tempDir }),
+			);
+		});
+
+		it("should trust project packages installed with installAndPersist local", async () => {
+			const packageRoot = join(tempDir, ".pi", "npm", "node_modules", "trusted-pkg");
+			const extensionPath = join(packageRoot, "extensions", "trusted.ts");
+			const runCommandSpy = vi.spyOn(packageManager as any, "runCommand").mockImplementation(async () => {
+				mkdirSync(join(packageRoot, "extensions"), { recursive: true });
+				writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "trusted-pkg", version: "1.0.0" }));
+				writeFileSync(extensionPath, "export default function() {}");
+			});
+
+			await packageManager.installAndPersist("npm:trusted-pkg", { local: true });
+
+			runCommandSpy.mockClear();
+			const result = await packageManager.resolve();
+
+			expect(result.extensions.some((resource) => resource.path === extensionPath && resource.enabled)).toBe(true);
+			expect(runCommandSpy).not.toHaveBeenCalled();
+		});
+	});
+
 	describe("npmCommand", () => {
 		it("should use npmCommand argv for npm installs", async () => {
 			settingsManager = SettingsManager.inMemory({
@@ -641,6 +692,7 @@ Content`,
 				cwd: tempDir,
 				agentDir,
 				settingsManager,
+				trustStore: TrustStore.create(tempDir, agentDir),
 			});
 
 			const runCommandSpy = vi.spyOn(packageManager as any, "runCommand").mockResolvedValue(undefined);
@@ -662,6 +714,7 @@ Content`,
 				cwd: tempDir,
 				agentDir,
 				settingsManager,
+				trustStore: TrustStore.create(tempDir, agentDir),
 			});
 
 			const runCommandSpy = vi.spyOn(packageManager as any, "runCommand").mockResolvedValue(undefined);
@@ -701,6 +754,7 @@ Content`,
 				cwd: tempDir,
 				agentDir,
 				settingsManager,
+				trustStore: TrustStore.create(tempDir, agentDir),
 			});
 
 			const source = "git:github.com/user/repo";
@@ -755,6 +809,7 @@ Content`,
 				cwd: tempDir,
 				agentDir,
 				settingsManager,
+				trustStore: TrustStore.create(tempDir, agentDir),
 			});
 
 			const source = "git:github.com/user/repo";
@@ -793,6 +848,7 @@ Content`,
 				cwd: tempDir,
 				agentDir,
 				settingsManager,
+				trustStore: TrustStore.create(tempDir, agentDir),
 			});
 
 			const root20 = join(tempDir, "node20", "lib", "node_modules");
@@ -833,6 +889,7 @@ Content`,
 				cwd: tempDir,
 				agentDir,
 				settingsManager,
+				trustStore: TrustStore.create(tempDir, agentDir),
 			});
 
 			const packagePath = join(agentDir, "npm", "node_modules", "pnpm-pkg");
@@ -878,6 +935,7 @@ Content`,
 				cwd: tempDir,
 				agentDir,
 				settingsManager,
+				trustStore: TrustStore.create(tempDir, agentDir),
 			});
 
 			const pnpmRoot = join(tempDir, "pnpm", "global", "v11");
@@ -920,6 +978,7 @@ Content`,
 				cwd: tempDir,
 				agentDir,
 				settingsManager,
+				trustStore: TrustStore.create(tempDir, agentDir),
 			});
 
 			const pnpmRoot = join(tempDir, "pnpm", "global", "v11");
@@ -946,6 +1005,7 @@ Content`,
 				cwd: tempDir,
 				agentDir,
 				settingsManager,
+				trustStore: TrustStore.create(tempDir, agentDir),
 			});
 
 			vi.spyOn(packageManager as any, "runCommandSync").mockReturnValue("not json");
@@ -2073,6 +2133,11 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "1.0.0" }));
 			writeFileSync(join(installedPath, "extensions", "index.ts"), "export default function() {};");
 			settingsManager.setProjectPackages(["npm:example"]);
+			TrustStore.create(tempDir, agentDir).trustProjectPackage({
+				projectCwd: tempDir,
+				entry: "npm:example",
+				artifact: "npm:example@1.0.0",
+			});
 
 			const runCommandCaptureSpy = vi.spyOn(packageManager as any, "runCommandCapture");
 
@@ -2085,7 +2150,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			const installedPath = join(tempDir, ".pi", "npm", "node_modules", "example");
 			mkdirSync(installedPath, { recursive: true });
 			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "1.0.0" }));
-			settingsManager.setProjectPackages(["npm:example@2.0.0"]);
+			settingsManager.setPackages(["npm:example@2.0.0"]);
 
 			const installParsedSourceSpy = vi
 				.spyOn(packageManager as any, "installParsedSource")
@@ -2163,6 +2228,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 				cwd: tempDir,
 				agentDir,
 				settingsManager,
+				trustStore: TrustStore.create(tempDir, agentDir),
 			});
 
 			const runCommandCaptureSpy = vi.spyOn(packageManager as any, "runCommandCapture").mockResolvedValue('"1.2.3"');

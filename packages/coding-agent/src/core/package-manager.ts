@@ -33,6 +33,7 @@ import { type GitSource, parseGitUrl } from "../utils/git.ts";
 import { canonicalizePath, isLocalPath, markPathIgnoredByCloudSync } from "../utils/paths.ts";
 import { isStdoutTakenOver } from "./output-guard.ts";
 import type { PackageSource, SettingsManager } from "./settings-manager.ts";
+import type { TrustStore } from "./trust-store.ts";
 
 const NETWORK_TIMEOUT_MS = 10000;
 const UPDATE_CHECK_CONCURRENCY = 4;
@@ -57,11 +58,25 @@ export interface ResolvedResource {
 	metadata: PathMetadata;
 }
 
+export interface ProjectPackageTrustCandidate {
+	source: string;
+	artifact: string;
+	displayArtifact: string;
+	trusted: boolean;
+}
+
+export interface UntrustedProjectPackage {
+	source: string;
+	artifact: string;
+	reason: "untrusted" | "unresolved";
+}
+
 export interface ResolvedPaths {
 	extensions: ResolvedResource[];
 	skills: ResolvedResource[];
 	prompts: ResolvedResource[];
 	themes: ResolvedResource[];
+	untrustedProjectPackages: UntrustedProjectPackage[];
 }
 
 export type MissingSourceAction = "install" | "skip" | "error";
@@ -105,12 +120,15 @@ export interface PackageManager {
 	removeSourceFromSettings(source: string, options?: { local?: boolean }): boolean;
 	setProgressCallback(callback: ProgressCallback | undefined): void;
 	getInstalledPath(source: string, scope: "user" | "project"): string | undefined;
+	listProjectPackageTrustCandidates(): Promise<ProjectPackageTrustCandidate[]>;
+	setProjectPackageTrust(source: string, artifact: string, trusted: boolean): void;
 }
 
 interface PackageManagerOptions {
 	cwd: string;
 	agentDir: string;
 	settingsManager: SettingsManager;
+	trustStore: TrustStore;
 }
 
 type SourceScope = "user" | "project" | "temporary";
@@ -156,6 +174,7 @@ interface ResourceAccumulator {
 	skills: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	prompts: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	themes: Map<string, { metadata: PathMetadata; enabled: boolean }>;
+	untrustedProjectPackages: UntrustedProjectPackage[];
 }
 
 /**
@@ -758,6 +777,7 @@ export class DefaultPackageManager implements PackageManager {
 	private cwd: string;
 	private agentDir: string;
 	private settingsManager: SettingsManager;
+	private trustStore: TrustStore;
 	private globalNpmRoot: string | undefined;
 	private globalNpmRootCommandKey: string | undefined;
 	private progressCallback: ProgressCallback | undefined;
@@ -766,6 +786,7 @@ export class DefaultPackageManager implements PackageManager {
 		this.cwd = options.cwd;
 		this.agentDir = options.agentDir;
 		this.settingsManager = options.settingsManager;
+		this.trustStore = options.trustStore;
 	}
 
 	setProgressCallback(callback: ProgressCallback | undefined): void {
@@ -913,6 +934,41 @@ export class DefaultPackageManager implements PackageManager {
 		return this.toResolvedPaths(accumulator);
 	}
 
+	async listProjectPackageTrustCandidates(): Promise<ProjectPackageTrustCandidate[]> {
+		const candidates: ProjectPackageTrustCandidate[] = [];
+		for (const pkg of this.settingsManager.getProjectSettings().packages ?? []) {
+			const source = typeof pkg === "string" ? pkg : pkg.source;
+			const parsed = this.parseSource(source);
+			if (parsed.type === "local") {
+				continue;
+			}
+			const artifact = await this.getArtifactIdentity(parsed, "project");
+			if (!artifact) {
+				continue;
+			}
+			candidates.push({
+				source,
+				artifact,
+				displayArtifact: await this.getArtifactDisplay(parsed, artifact),
+				trusted: this.trustStore.isProjectPackageTrusted({ projectCwd: this.cwd, entry: pkg, artifact }),
+			});
+		}
+		return candidates;
+	}
+
+	setProjectPackageTrust(source: string, artifact: string, trusted: boolean): void {
+		const entry =
+			this.settingsManager
+				.getProjectSettings()
+				.packages?.find((pkg) => (typeof pkg === "string" ? pkg : pkg.source) === source) ?? source;
+		const input = { projectCwd: this.cwd, entry, artifact };
+		if (trusted) {
+			this.trustStore.trustProjectPackage(input);
+		} else {
+			this.trustStore.untrustProjectPackage(input);
+		}
+	}
+
 	listConfiguredPackages(): ConfiguredPackage[] {
 		const globalSettings = this.settingsManager.getGlobalSettings();
 		const projectSettings = this.settingsManager.getProjectSettings();
@@ -967,6 +1023,9 @@ export class DefaultPackageManager implements PackageManager {
 	async installAndPersist(source: string, options?: { local?: boolean }): Promise<void> {
 		await this.install(source, options);
 		this.addSourceToSettings(source, options);
+		if (options?.local) {
+			await this.trustInstalledProjectPackage(source);
+		}
 	}
 
 	async remove(source: string, options?: { local?: boolean }): Promise<void> {
@@ -1201,6 +1260,22 @@ export class DefaultPackageManager implements PackageManager {
 				continue;
 			}
 
+			if (scope === "project") {
+				const artifact = await this.getArtifactIdentity(parsed, "project");
+				if (!artifact) {
+					accumulator.untrustedProjectPackages.push({
+						source: sourceStr,
+						artifact: "unknown",
+						reason: "unresolved",
+					});
+					continue;
+				}
+				if (!this.trustStore.isProjectPackageTrusted({ projectCwd: this.cwd, entry: pkg, artifact })) {
+					accumulator.untrustedProjectPackages.push({ source: sourceStr, artifact, reason: "untrusted" });
+					continue;
+				}
+			}
+
 			const installMissing = async (): Promise<boolean> => {
 				if (isOfflineModeEnabled()) {
 					return false;
@@ -1285,6 +1360,107 @@ export class DefaultPackageManager implements PackageManager {
 			await this.installGit(parsed, scope);
 			return;
 		}
+	}
+
+	private async trustInstalledProjectPackage(source: string): Promise<void> {
+		const parsed = this.parseSource(source);
+		if (parsed.type === "local") {
+			return;
+		}
+		const artifact = await this.getInstalledArtifactIdentity(parsed, "project");
+		if (!artifact) {
+			return;
+		}
+		this.trustStore.trustProjectPackage({
+			projectCwd: this.cwd,
+			entry: this.normalizePackageSourceForSettings(source, "project"),
+			artifact,
+		});
+	}
+
+	private async getArtifactIdentity(
+		parsed: Exclude<ParsedSource, LocalSource>,
+		scope: Exclude<SourceScope, "temporary">,
+	): Promise<string | undefined> {
+		return (await this.getInstalledArtifactIdentity(parsed, scope)) ?? this.getRemoteArtifactIdentity(parsed);
+	}
+
+	private async getInstalledArtifactIdentity(
+		parsed: Exclude<ParsedSource, LocalSource>,
+		scope: Exclude<SourceScope, "temporary">,
+	): Promise<string | undefined> {
+		if (parsed.type === "npm") {
+			const installedPath = this.getNpmInstallPath(parsed, scope);
+			if (!existsSync(installedPath)) {
+				return undefined;
+			}
+			const version = this.getInstalledNpmVersion(installedPath);
+			return version ? `npm:${parsed.name}@${version}` : undefined;
+		}
+
+		const installedPath = this.getGitInstallPath(parsed, scope);
+		if (!existsSync(installedPath)) {
+			return undefined;
+		}
+		try {
+			const commit = await this.runCommandCapture("git", ["rev-parse", "HEAD"], {
+				cwd: installedPath,
+				timeoutMs: NETWORK_TIMEOUT_MS,
+			});
+			return `git:${parsed.host}/${parsed.path}@${commit.trim()}`;
+		} catch {
+			return undefined;
+		}
+	}
+
+	private async getRemoteArtifactIdentity(parsed: Exclude<ParsedSource, LocalSource>): Promise<string | undefined> {
+		if (isOfflineModeEnabled()) {
+			return undefined;
+		}
+		try {
+			if (parsed.type === "npm") {
+				const metadata = await this.getNpmRemoteMetadata(parsed);
+				return metadata?.version ? `npm:${parsed.name}@${metadata.version}` : undefined;
+			}
+
+			const ref = parsed.ref ?? "HEAD";
+			const output = await this.runGitRemoteCommand(this.cwd, ["ls-remote", parsed.repo, ref]);
+			const match = output.match(/^([0-9a-f]{40})\s+/m);
+			return match?.[1] ? `git:${parsed.host}/${parsed.path}@${match[1]}` : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	private async getArtifactDisplay(parsed: Exclude<ParsedSource, LocalSource>, artifact: string): Promise<string> {
+		if (parsed.type === "npm") {
+			const metadata = await this.getNpmRemoteMetadata(parsed);
+			if (!metadata?.version) return artifact;
+			return metadata.date ? `${metadata.version} published ${metadata.date}` : metadata.version;
+		}
+		const commit = artifact.match(/@([0-9a-f]{40})$/)?.[1];
+		if (!commit) return artifact;
+		const date = await this.getGitCommitDate(parsed, commit);
+		return date ? `${commit.slice(0, 12)} committed ${date}` : commit.slice(0, 12);
+	}
+
+	private async getNpmRemoteMetadata(parsed: NpmSource): Promise<{ version?: string; date?: string } | undefined> {
+		try {
+			const metadata = JSON.parse(
+				await this.runCommandCapture(
+					this.getNpmCommand().command,
+					[...this.getNpmCommand().args, "view", parsed.spec, "version", "time", "--json"],
+					{ cwd: this.cwd, timeoutMs: NETWORK_TIMEOUT_MS },
+				),
+			) as { version?: string; time?: Record<string, string> };
+			return { version: metadata.version, date: metadata.version ? metadata.time?.[metadata.version] : undefined };
+		} catch {
+			return undefined;
+		}
+	}
+
+	private async getGitCommitDate(_parsed: GitSource, _commit: string): Promise<string | undefined> {
+		return undefined;
 	}
 
 	private getPackageSourceString(pkg: PackageSource): string {
@@ -2377,6 +2553,7 @@ export class DefaultPackageManager implements PackageManager {
 			skills: new Map(),
 			prompts: new Map(),
 			themes: new Map(),
+			untrustedProjectPackages: [],
 		};
 	}
 
@@ -2405,6 +2582,7 @@ export class DefaultPackageManager implements PackageManager {
 			skills: mapToResolved(accumulator.skills),
 			prompts: mapToResolved(accumulator.prompts),
 			themes: mapToResolved(accumulator.themes),
+			untrustedProjectPackages: accumulator.untrustedProjectPackages,
 		};
 	}
 

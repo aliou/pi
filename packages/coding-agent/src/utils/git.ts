@@ -161,7 +161,10 @@ export function parseGitUrl(source: string): GitSource | null {
 				type: "git",
 				repo: useHttpsPrefix ? `https://${split.repo}` : split.repo,
 				host: info.domain || "",
-				path: `${info.user}/${info.project}`.replace(/\.git$/, ""),
+				path: [info.user, info.project]
+					.filter(Boolean)
+					.join("/")
+					.replace(/\.git$/, ""),
 				ref: info.committish || split.ref || undefined,
 				pinned: Boolean(info.committish || split.ref),
 			};
@@ -181,7 +184,10 @@ export function parseGitUrl(source: string): GitSource | null {
 				type: "git",
 				repo: `https://${split.repo}`,
 				host: info.domain || "",
-				path: `${info.user}/${info.project}`.replace(/\.git$/, ""),
+				path: [info.user, info.project]
+					.filter(Boolean)
+					.join("/")
+					.replace(/\.git$/, ""),
 				ref: info.committish || split.ref || undefined,
 				pinned: Boolean(info.committish || split.ref),
 			};

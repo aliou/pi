@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DefaultPackageManager } from "../src/core/package-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import { TrustStore } from "../src/core/trust-store.ts";
 
 describe("Package Manager git source parsing", () => {
 	let tempDir: string;
@@ -22,6 +23,7 @@ describe("Package Manager git source parsing", () => {
 			cwd: tempDir,
 			agentDir,
 			settingsManager,
+			trustStore: TrustStore.create(tempDir, agentDir),
 		});
 	});
 

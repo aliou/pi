@@ -19,6 +19,7 @@ import { SettingsManager } from "./settings-manager.ts";
 import type { Skill } from "./skills.ts";
 import { loadSkills } from "./skills.ts";
 import { createSourceInfo, type SourceInfo } from "./source-info.ts";
+import { TrustStore } from "./trust-store.ts";
 
 export interface ResourceExtensionPaths {
 	skillPaths?: Array<{ path: string; metadata: PathMetadata }>;
@@ -31,6 +32,7 @@ export interface ResourceLoader {
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] };
 	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] };
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] };
+	getPackageDiagnostics(): ResourceDiagnostic[];
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> };
 	getSystemPrompt(): string | undefined;
 	getAppendSystemPrompt(): string[];
@@ -117,6 +119,7 @@ export interface DefaultResourceLoaderOptions {
 	cwd: string;
 	agentDir: string;
 	settingsManager?: SettingsManager;
+	trustStore?: TrustStore;
 	eventBus?: EventBus;
 	additionalExtensionPaths?: string[];
 	additionalSkillPaths?: string[];
@@ -154,6 +157,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private cwd: string;
 	private agentDir: string;
 	private settingsManager: SettingsManager;
+	private trustStore: TrustStore;
 	private eventBus: EventBus;
 	private packageManager: DefaultPackageManager;
 	private additionalExtensionPaths: string[];
@@ -194,6 +198,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private promptDiagnostics: ResourceDiagnostic[];
 	private themes: Theme[];
 	private themeDiagnostics: ResourceDiagnostic[];
+	private packageDiagnostics: ResourceDiagnostic[];
 	private agentsFiles: Array<{ path: string; content: string }>;
 	private systemPrompt?: string;
 	private appendSystemPrompt: string[];
@@ -208,11 +213,13 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.cwd = options.cwd;
 		this.agentDir = options.agentDir;
 		this.settingsManager = options.settingsManager ?? SettingsManager.create(this.cwd, this.agentDir);
+		this.trustStore = options.trustStore ?? TrustStore.create(this.cwd, this.agentDir);
 		this.eventBus = options.eventBus ?? createEventBus();
 		this.packageManager = new DefaultPackageManager({
 			cwd: this.cwd,
 			agentDir: this.agentDir,
 			settingsManager: this.settingsManager,
+			trustStore: this.trustStore,
 		});
 		this.additionalExtensionPaths = options.additionalExtensionPaths ?? [];
 		this.additionalSkillPaths = options.additionalSkillPaths ?? [];
@@ -241,6 +248,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.promptDiagnostics = [];
 		this.themes = [];
 		this.themeDiagnostics = [];
+		this.packageDiagnostics = [];
 		this.agentsFiles = [];
 		this.appendSystemPrompt = [];
 		this.lastSkillPaths = [];
@@ -265,6 +273,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] } {
 		return { themes: this.themes, diagnostics: this.themeDiagnostics };
+	}
+
+	getPackageDiagnostics(): ResourceDiagnostic[] {
+		return this.packageDiagnostics;
 	}
 
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> } {
@@ -374,6 +386,22 @@ export class DefaultResourceLoader implements ResourceLoader {
 		};
 
 		const enabledSkills = enabledSkillResources.map(mapSkillPath);
+		if (resolvedPaths.untrustedProjectPackages.length > 0) {
+			const unresolved = resolvedPaths.untrustedProjectPackages.filter((pkg) => pkg.reason === "unresolved");
+			const untrusted = resolvedPaths.untrustedProjectPackages.filter((pkg) => pkg.reason === "untrusted");
+			const lines = ["Project packages were not loaded. Run pi trust to review them."];
+			if (untrusted.length > 0) {
+				lines.push("", "Untrusted packages:");
+				lines.push(...untrusted.map((pkg) => `- ${pkg.source}`));
+			}
+			if (unresolved.length > 0) {
+				lines.push("", "Packages with unresolved trust identity:");
+				lines.push(...unresolved.map((pkg) => `- ${pkg.source}`));
+			}
+			this.packageDiagnostics = [{ type: "warning", message: lines.join("\n") }];
+		} else {
+			this.packageDiagnostics = [];
+		}
 
 		// Add CLI paths metadata
 		for (const r of cliExtensionPaths.extensions) {

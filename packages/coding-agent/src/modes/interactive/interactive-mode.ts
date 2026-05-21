@@ -84,6 +84,7 @@ import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
+import { TrustStore } from "../../core/trust-store.ts";
 import { getChangelogPath, getNewEntries, parseChangelog } from "../../utils/changelog.ts";
 import { copyToClipboard } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
@@ -798,6 +799,7 @@ export class InteractiveMode {
 				cwd: this.sessionManager.getCwd(),
 				agentDir: getAgentDir(),
 				settingsManager: this.settingsManager,
+				trustStore: TrustStore.create(this.sessionManager.getCwd(), getAgentDir()),
 			});
 			const updates = await packageManager.checkForAvailableUpdates();
 			return updates.map((update) => update.displayName);
@@ -1429,6 +1431,13 @@ export class InteractiveMode {
 		}
 
 		if (showDiagnostics) {
+			const packageDiagnostics = this.session.resourceLoader.getPackageDiagnostics();
+			if (packageDiagnostics.length > 0) {
+				const warningLines = this.formatDiagnostics(packageDiagnostics, sourceInfos);
+				this.chatContainer.addChild(new Text(`${theme.fg("warning", "[Package issues]")}\n${warningLines}`, 0, 0));
+				this.chatContainer.addChild(new Spacer(1));
+			}
+
 			const skillDiagnostics = skillsResult.diagnostics;
 			if (skillDiagnostics.length > 0) {
 				const warningLines = this.formatDiagnostics(skillDiagnostics, sourceInfos);

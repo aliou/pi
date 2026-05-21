@@ -1,6 +1,7 @@
 import { Markdown, type MarkdownTheme } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { selectConfig } from "./cli/config-selector.ts";
+import { selectTrust } from "./cli/trust-selector.ts";
 import {
 	APP_NAME,
 	detectInstallMethod,
@@ -14,6 +15,7 @@ import {
 } from "./config.ts";
 import { DefaultPackageManager } from "./core/package-manager.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
+import { TrustStore } from "./core/trust-store.ts";
 import { spawnProcess } from "./utils/child-process.ts";
 import { getLatestPiRelease, isNewerPackageVersion } from "./utils/version-check.ts";
 import {
@@ -398,7 +400,12 @@ export async function handleConfigCommand(args: string[]): Promise<boolean> {
 	const agentDir = getAgentDir();
 	const settingsManager = SettingsManager.create(cwd, agentDir);
 	reportSettingsErrors(settingsManager, "config command");
-	const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+	const packageManager = new DefaultPackageManager({
+		cwd,
+		agentDir,
+		settingsManager,
+		trustStore: TrustStore.create(cwd, agentDir),
+	});
 	const resolvedPaths = await packageManager.resolve();
 
 	await selectConfig({
@@ -409,6 +416,26 @@ export async function handleConfigCommand(args: string[]): Promise<boolean> {
 	});
 
 	process.exit(0);
+}
+
+export async function handleTrustCommand(args: string[]): Promise<boolean> {
+	if (args[0] !== "trust") {
+		return false;
+	}
+
+	const cwd = process.cwd();
+	const agentDir = getAgentDir();
+	const settingsManager = SettingsManager.create(cwd, agentDir);
+	reportSettingsErrors(settingsManager, "trust command");
+	const packageManager = new DefaultPackageManager({
+		cwd,
+		agentDir,
+		settingsManager,
+		trustStore: TrustStore.create(cwd, agentDir),
+	});
+	const candidates = await packageManager.listProjectPackageTrustCandidates();
+	await selectTrust({ packageManager, settingsManager, candidates });
+	return true;
 }
 
 export async function handlePackageCommand(args: string[]): Promise<boolean> {
@@ -464,7 +491,12 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 	reportSettingsErrors(settingsManager, "package command");
 	const selfUpdateNpmCommand = settingsManager.getGlobalSettings().npmCommand;
 
-	const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+	const packageManager = new DefaultPackageManager({
+		cwd,
+		agentDir,
+		settingsManager,
+		trustStore: TrustStore.create(cwd, agentDir),
+	});
 
 	packageManager.setProgressCallback((event) => {
 		if (event.type === "start") {

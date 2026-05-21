@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DefaultPackageManager } from "../src/core/package-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import { TrustStore } from "../src/core/trust-store.ts";
 
 // Helper to run git commands in a directory
 function git(args: string[], cwd: string): string {
@@ -80,6 +81,7 @@ describe("DefaultPackageManager git update", () => {
 			cwd: tempDir,
 			agentDir,
 			settingsManager,
+			trustStore: TrustStore.create(tempDir, agentDir),
 		});
 	});
 
