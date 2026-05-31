@@ -281,6 +281,7 @@ export {
 	type WriteToolOptions,
 	withFileMutationQueue,
 } from "./core/tools/index.ts";
+export type { TrustCandidate, TrustStore, TrustStoreEntry } from "./core/trust-store.ts";
 // Main entry point
 export { type MainOptions, main } from "./main.ts";
 // Run modes for programmatic SDK usage
