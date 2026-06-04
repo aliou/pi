@@ -33,7 +33,7 @@ import { type GitSource, parseGitUrl } from "../utils/git.ts";
 import { canonicalizePath, isLocalPath, markPathIgnoredByCloudSync, resolvePath } from "../utils/paths.ts";
 import { isStdoutTakenOver } from "./output-guard.ts";
 import type { PackageSource, SettingsManager } from "./settings-manager.ts";
-import type { TrustStore } from "./trust-store.ts";
+import type { TrustCandidate, TrustStore, TrustStoreEntry } from "./trust-store.ts";
 import { FilesystemTrustStore } from "./trust-store.ts";
 
 const NETWORK_TIMEOUT_MS = 10000;
@@ -115,6 +115,8 @@ export interface PackageManager {
 	setProgressCallback(callback: ProgressCallback | undefined): void;
 	getInstalledPath(source: string, scope: "user" | "project"): string | undefined;
 	getUntrustedProjectPackages(): UntrustedProjectPackage[];
+	listTrustCandidates(): Promise<TrustCandidate[]>;
+	updateTrustCandidates(candidates: TrustCandidate[]): Promise<void>;
 }
 
 interface PackageManagerOptions {
@@ -847,6 +849,47 @@ export class DefaultPackageManager implements PackageManager {
 		return [...this.untrustedProjectPackages];
 	}
 
+	async listTrustCandidates(): Promise<TrustCandidate[]> {
+		const projectSettings = this.settingsManager.getProjectSettings();
+		const trustEntries = await this.trustStore.listTrustEntries();
+		const candidates: TrustCandidate[] = [];
+		for (const pkg of projectSettings.packages ?? []) {
+			const candidate = await this.getTrustCandidate({ pkg, scope: "project" });
+			if (!candidate || candidate.reason === "unresolved") {
+				continue;
+			}
+			candidates.push({
+				source: candidate.source,
+				hash: candidate.hash,
+				name: candidate.name,
+				trusted: trustEntries.some((entry) => entry.source === candidate.source && entry.hash === candidate.hash),
+			});
+		}
+		return candidates;
+	}
+
+	async updateTrustCandidates(candidates: TrustCandidate[]): Promise<void> {
+		const existing = await this.trustStore.listTrustEntries();
+		const candidateSources = new Set(candidates.map((candidate) => candidate.source));
+		const trustedEntries: TrustStoreEntry[] = candidates
+			.filter((candidate) => candidate.trusted)
+			.map((candidate) => {
+				const existingEntry = existing.find(
+					(entry) => entry.source === candidate.source && entry.hash === candidate.hash,
+				);
+				return {
+					source: candidate.source,
+					hash: candidate.hash,
+					name: candidate.name,
+					trustedAt: existingEntry?.trustedAt ?? new Date().toISOString(),
+				};
+			});
+		await this.trustStore.updateTrustEntries([
+			...existing.filter((entry) => !candidateSources.has(entry.source)),
+			...trustedEntries,
+		]);
+	}
+
 	getInstalledPath(source: string, scope: "user" | "project"): string | undefined {
 		const parsed = this.parseSource(source);
 		if (parsed.type === "npm") {
@@ -1006,6 +1049,9 @@ export class DefaultPackageManager implements PackageManager {
 	async installAndPersist(source: string, options?: { local?: boolean }): Promise<void> {
 		await this.install(source, options);
 		this.addSourceToSettings(source, options);
+		if (options?.local) {
+			await this.trustInstalledProjectPackage(source);
+		}
 	}
 
 	async remove(source: string, options?: { local?: boolean }): Promise<void> {
@@ -1385,6 +1431,23 @@ export class DefaultPackageManager implements PackageManager {
 		}
 
 		return suggestions.values().next().value;
+	}
+
+	private async trustInstalledProjectPackage(source: string): Promise<void> {
+		const candidate = await this.getTrustCandidate({ pkg: source, scope: "project" });
+		if (!candidate || candidate.reason === "unresolved") {
+			return;
+		}
+		const entries = await this.trustStore.listTrustEntries();
+		await this.trustStore.updateTrustEntries([
+			...entries.filter((entry) => entry.source !== candidate.source),
+			{
+				source: candidate.source,
+				hash: candidate.hash,
+				name: candidate.name,
+				trustedAt: new Date().toISOString(),
+			},
+		]);
 	}
 
 	private async filterTrustedPackageSources(
