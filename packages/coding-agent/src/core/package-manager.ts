@@ -91,6 +91,13 @@ export interface ConfiguredPackage {
 	installedPath?: string;
 }
 
+export interface UntrustedProjectPackage {
+	source: string;
+	hash: string;
+	name: string;
+	reason: "untrusted" | "unresolved";
+}
+
 export interface PackageManager {
 	resolve(onMissing?: (source: string) => Promise<MissingSourceAction>): Promise<ResolvedPaths>;
 	install(source: string, options?: { local?: boolean }): Promise<void>;
@@ -107,6 +114,7 @@ export interface PackageManager {
 	removeSourceFromSettings(source: string, options?: { local?: boolean }): boolean;
 	setProgressCallback(callback: ProgressCallback | undefined): void;
 	getInstalledPath(source: string, scope: "user" | "project"): string | undefined;
+	getUntrustedProjectPackages(): UntrustedProjectPackage[];
 }
 
 interface PackageManagerOptions {
@@ -769,6 +777,7 @@ export class DefaultPackageManager implements PackageManager {
 	private agentDir: string;
 	private settingsManager: SettingsManager;
 	private trustStore: TrustStore;
+	private untrustedProjectPackages: UntrustedProjectPackage[];
 	private globalNpmRoot: string | undefined;
 	private globalNpmRootCommandKey: string | undefined;
 	private progressCallback: ProgressCallback | undefined;
@@ -778,6 +787,7 @@ export class DefaultPackageManager implements PackageManager {
 		this.agentDir = resolvePath(options.agentDir);
 		this.settingsManager = options.settingsManager;
 		this.trustStore = options.trustStore ?? new FilesystemTrustStore(this.cwd, this.agentDir);
+		this.untrustedProjectPackages = [];
 	}
 
 	setProgressCallback(callback: ProgressCallback | undefined): void {
@@ -833,6 +843,10 @@ export class DefaultPackageManager implements PackageManager {
 		return true;
 	}
 
+	getUntrustedProjectPackages(): UntrustedProjectPackage[] {
+		return [...this.untrustedProjectPackages];
+	}
+
 	getInstalledPath(source: string, scope: "user" | "project"): string | undefined {
 		const parsed = this.parseSource(source);
 		if (parsed.type === "npm") {
@@ -873,6 +887,7 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	async resolve(onMissing?: (source: string) => Promise<MissingSourceAction>): Promise<ResolvedPaths> {
+		this.untrustedProjectPackages = [];
 		const accumulator = this.createAccumulator();
 		const globalSettings = this.settingsManager.getGlobalSettings();
 		const projectSettings = this.settingsManager.getProjectSettings();
@@ -887,7 +902,7 @@ export class DefaultPackageManager implements PackageManager {
 		}
 
 		// Dedupe: project scope wins over global for same package identity
-		const packageSources = this.dedupePackages(allPackages);
+		const packageSources = await this.filterTrustedPackageSources(this.dedupePackages(allPackages));
 		await this.resolvePackageSources(packageSources, accumulator, onMissing);
 
 		const globalBaseDir = this.agentDir;
@@ -1372,6 +1387,91 @@ export class DefaultPackageManager implements PackageManager {
 		return suggestions.values().next().value;
 	}
 
+	private async filterTrustedPackageSources(
+		sources: Array<{ pkg: PackageSource; scope: SourceScope }>,
+	): Promise<Array<{ pkg: PackageSource; scope: SourceScope }>> {
+		const trustEntries = await this.trustStore.listTrustEntries();
+		const trustedSources: Array<{ pkg: PackageSource; scope: SourceScope }> = [];
+
+		for (const entry of sources) {
+			const candidate = await this.getTrustCandidate(entry);
+			if (!candidate) {
+				trustedSources.push(entry);
+				continue;
+			}
+			if (
+				trustEntries.some(
+					(trustEntry) => trustEntry.source === candidate.source && trustEntry.hash === candidate.hash,
+				)
+			) {
+				trustedSources.push(entry);
+				continue;
+			}
+			this.untrustedProjectPackages.push(candidate);
+		}
+
+		return trustedSources;
+	}
+
+	private async getTrustCandidate(entry: {
+		pkg: PackageSource;
+		scope: SourceScope;
+	}): Promise<UntrustedProjectPackage | undefined> {
+		if (entry.scope !== "project") {
+			return undefined;
+		}
+		const source = this.getPackageSourceString(entry.pkg);
+		if (!source.startsWith("npm:") && !source.startsWith("git:")) {
+			return undefined;
+		}
+		const parsed = this.parseSource(source);
+		if (parsed.type === "npm") {
+			return this.getNpmTrustCandidate(source, parsed);
+		}
+		if (parsed.type === "git") {
+			return this.getGitTrustCandidate(source, parsed);
+		}
+		return undefined;
+	}
+
+	private async getNpmTrustCandidate(source: string, parsed: NpmSource): Promise<UntrustedProjectPackage> {
+		try {
+			const version = await this.getNpmVersion(parsed.spec);
+			return {
+				source,
+				hash: `npm:${parsed.name}@${version}`,
+				name: parsed.name,
+				reason: "untrusted",
+			};
+		} catch {
+			return {
+				source,
+				hash: "",
+				name: parsed.name,
+				reason: "unresolved",
+			};
+		}
+	}
+
+	private async getGitTrustCandidate(source: string, parsed: GitSource): Promise<UntrustedProjectPackage> {
+		try {
+			const head = await this.getRemoteGitSourceHead(parsed);
+			return {
+				source,
+				hash: `git:${parsed.host}/${parsed.path}@${head}`,
+				name: `${parsed.host}/${parsed.path}`,
+				reason: "untrusted",
+			};
+		} catch {
+			return {
+				source,
+				hash: "",
+				name: `${parsed.host}/${parsed.path}`,
+				reason: "unresolved",
+			};
+		}
+	}
+
 	private packageSourcesMatch(existing: PackageSource, inputSource: string, scope: SourceScope): boolean {
 		const left = this.getSourceMatchKeyForSettings(this.getPackageSourceString(existing), scope);
 		const right = this.getSourceMatchKeyForInput(inputSource);
@@ -1459,15 +1559,23 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async getLatestNpmVersion(packageName: string): Promise<string> {
+		return this.getNpmVersion(packageName);
+	}
+
+	private async getNpmVersion(spec: string): Promise<string> {
 		const npmCommand = this.getNpmCommand();
 		const stdout = await this.runCommandCapture(
 			npmCommand.command,
-			[...npmCommand.args, "view", packageName, "version", "--json"],
+			[...npmCommand.args, "view", spec, "version", "--json"],
 			{ cwd: this.cwd, timeoutMs: NETWORK_TIMEOUT_MS },
 		);
 		const raw = stdout.trim();
 		if (!raw) throw new Error("Empty response from npm view");
-		return JSON.parse(raw);
+		const parsed = JSON.parse(raw) as unknown;
+		if (typeof parsed !== "string" || parsed.length === 0) {
+			throw new Error("Invalid version response from npm view");
+		}
+		return parsed;
 	}
 
 	private async gitHasAvailableUpdate(installedPath: string): Promise<boolean> {
@@ -1501,6 +1609,20 @@ export class DefaultPackageManager implements PackageManager {
 		const match = remoteHead.match(/^([0-9a-f]{40})\s+HEAD$/m);
 		if (!match?.[1]) {
 			throw new Error("Failed to determine remote HEAD");
+		}
+		return match[1];
+	}
+
+	private async getRemoteGitSourceHead(source: GitSource): Promise<string> {
+		const ref = source.ref ?? "HEAD";
+		const output = await this.runCommandCapture("git", ["ls-remote", source.repo, ref], {
+			cwd: this.cwd,
+			timeoutMs: NETWORK_TIMEOUT_MS,
+			env: { GIT_TERMINAL_PROMPT: "0" },
+		});
+		const match = output.match(/^([0-9a-f]{40})\s+/m);
+		if (!match?.[1]) {
+			throw new Error(`Failed to determine remote ref for ${source.repo}`);
 		}
 		return match[1];
 	}

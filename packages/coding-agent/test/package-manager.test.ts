@@ -2297,18 +2297,25 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			expect(refreshTemporaryGitSourceSpy).not.toHaveBeenCalled();
 		});
 
-		it("should not run npm view during resolve for installed unpinned packages", async () => {
+		it("should resolve npm trust identity before loading project packages", async () => {
 			const installedPath = join(tempDir, ".pi", "npm", "node_modules", "example");
 			mkdirSync(join(installedPath, "extensions"), { recursive: true });
 			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "1.0.0" }));
 			writeFileSync(join(installedPath, "extensions", "index.ts"), "export default function() {};");
 			settingsManager.setProjectPackages(["npm:example"]);
+			await (packageManager as any).trustStore.updateTrustEntries([
+				{ source: "npm:example", hash: "npm:example@1.0.0", name: "example", trustedAt: new Date().toISOString() },
+			]);
 
-			const runCommandCaptureSpy = vi.spyOn(packageManager as any, "runCommandCapture");
+			const runCommandCaptureSpy = vi.spyOn(packageManager as any, "runCommandCapture").mockResolvedValue('"1.0.0"');
 
 			const result = await packageManager.resolve();
 			expect(result.extensions.some((r) => pathEndsWith(r.path, "extensions/index.ts") && r.enabled)).toBe(true);
-			expect(runCommandCaptureSpy).not.toHaveBeenCalled();
+			expect(runCommandCaptureSpy).toHaveBeenCalledWith(
+				"npm",
+				expect.arrayContaining(["view", "example", "version", "--json"]),
+				expect.any(Object),
+			);
 		});
 
 		it("should reinstall pinned npm packages when installed version does not match", async () => {
@@ -2316,7 +2323,16 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			mkdirSync(installedPath, { recursive: true });
 			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "1.0.0" }));
 			settingsManager.setProjectPackages(["npm:example@2.0.0"]);
+			await (packageManager as any).trustStore.updateTrustEntries([
+				{
+					source: "npm:example@2.0.0",
+					hash: "npm:example@2.0.0",
+					name: "example",
+					trustedAt: new Date().toISOString(),
+				},
+			]);
 
+			vi.spyOn(packageManager as any, "runCommandCapture").mockResolvedValue('"2.0.0"');
 			const installParsedSourceSpy = vi
 				.spyOn(packageManager as any, "installParsedSource")
 				.mockResolvedValue(undefined);

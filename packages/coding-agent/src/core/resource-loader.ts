@@ -32,6 +32,7 @@ export interface ResourceLoader {
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] };
 	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] };
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] };
+	getPackageDiagnostics(): ResourceDiagnostic[];
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> };
 	getSystemPrompt(): string | undefined;
 	getAppendSystemPrompt(): string[];
@@ -197,6 +198,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private promptDiagnostics: ResourceDiagnostic[];
 	private themes: Theme[];
 	private themeDiagnostics: ResourceDiagnostic[];
+	private packageDiagnostics: ResourceDiagnostic[];
 	private agentsFiles: Array<{ path: string; content: string }>;
 	private systemPrompt?: string;
 	private appendSystemPrompt: string[];
@@ -246,6 +248,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.promptDiagnostics = [];
 		this.themes = [];
 		this.themeDiagnostics = [];
+		this.packageDiagnostics = [];
 		this.agentsFiles = [];
 		this.appendSystemPrompt = [];
 		this.lastSkillPaths = [];
@@ -270,6 +273,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] } {
 		return { themes: this.themes, diagnostics: this.themeDiagnostics };
+	}
+
+	getPackageDiagnostics(): ResourceDiagnostic[] {
+		return [...this.packageDiagnostics];
 	}
 
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> } {
@@ -327,6 +334,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	async reload(): Promise<void> {
 		await this.settingsManager.reload();
 		const resolvedPaths = await this.packageManager.resolve();
+		this.updatePackageDiagnostics();
 		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
 			temporary: true,
 		});
@@ -492,6 +500,31 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.appendSystemPrompt = this.appendSystemPromptOverride
 			? this.appendSystemPromptOverride(baseAppend)
 			: baseAppend;
+	}
+
+	private updatePackageDiagnostics(): void {
+		const untrustedPackages = this.packageManager.getUntrustedProjectPackages();
+		if (untrustedPackages.length === 0) {
+			this.packageDiagnostics = [];
+			return;
+		}
+
+		const untrusted = untrustedPackages.filter((pkg) => pkg.reason === "untrusted");
+		const unresolved = untrustedPackages.filter((pkg) => pkg.reason === "unresolved");
+		const lines = ["Project packages were not loaded. Run `pi trust` to review project package trust."];
+		if (untrusted.length > 0) {
+			lines.push("", "Untrusted packages:", ...untrusted.map((pkg) => `- ${pkg.source}`));
+		}
+		if (unresolved.length > 0) {
+			lines.push("", "Packages with unresolved trust identity:", ...unresolved.map((pkg) => `- ${pkg.source}`));
+		}
+
+		this.packageDiagnostics = [
+			{
+				type: "warning",
+				message: lines.join("\n"),
+			},
+		];
 	}
 
 	private normalizeExtensionPaths(
