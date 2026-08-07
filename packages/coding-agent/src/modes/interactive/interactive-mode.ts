@@ -334,6 +334,7 @@ export interface InteractiveModeOptions {
 interface InteractiveTuiOptions {
 	tuiMode: TuiMode;
 	showHardwareCursor: boolean;
+	fullscreenCopyOnSelect: boolean;
 	logDirectory: string;
 	terminal?: Terminal;
 	onRightClickPaste?: () => void;
@@ -347,6 +348,7 @@ export function createInteractiveTui(options: InteractiveTuiOptions): TuiMainScr
 		return new TuiAltScreen(terminal, options.showHardwareCursor, options.logDirectory, {
 			searchMatchStyle: (text) => theme.underline(styleSearchMatch(text)),
 			searchCurrentMatchStyle: (text) => theme.bold(theme.inverse(styleSearchMatch(text))),
+			copyOnSelect: options.fullscreenCopyOnSelect,
 			openUrl: openBrowser,
 			onRightClickPaste: options.onRightClickPaste,
 		});
@@ -543,6 +545,7 @@ export class InteractiveMode {
 		this.renderer = createInteractiveTui({
 			tuiMode,
 			showHardwareCursor: this.settingsManager.getShowHardwareCursor(),
+			fullscreenCopyOnSelect: this.settingsManager.getFullscreenCopyOnSelect(),
 			logDirectory: getAgentDir(),
 			onRightClickPaste: this.onRightClickPaste,
 		});
@@ -811,6 +814,7 @@ export class InteractiveMode {
 		const nextUi = createInteractiveTui({
 			tuiMode: mode,
 			showHardwareCursor,
+			fullscreenCopyOnSelect: this.settingsManager.getFullscreenCopyOnSelect(),
 			logDirectory: getAgentDir(),
 			terminal,
 			onRightClickPaste: this.onRightClickPaste,
@@ -2808,7 +2812,10 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
 		this.defaultEditor.onAction("app.editor.external", () => void this.handleOpenExternalEditor());
-		this.defaultEditor.onAction("app.message.copy", () => void this.handleCopyCommand({ flashConfirmation: true }));
+		this.defaultEditor.onAction(
+			"app.message.copy",
+			() => void this.handleCopyCommand({ flashConfirmation: true, preferFullscreenSelection: true }),
+		);
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
 		this.defaultEditor.onAction("app.message.dequeue", () => this.handleDequeue());
 		this.defaultEditor.onAction("app.session.new", () => this.handleClearCommand());
@@ -4414,6 +4421,7 @@ export class InteractiveMode {
 					tuiMode: this.ui.mode,
 					fullscreenExitOutput: this.settingsManager.getFullscreenExitOutput(),
 					fullscreenScrollbar: this.settingsManager.getFullscreenScrollbar(),
+					fullscreenCopyOnSelect: this.settingsManager.getFullscreenCopyOnSelect(),
 					warnings: this.settingsManager.getWarnings(),
 				},
 				{
@@ -4575,6 +4583,10 @@ export class InteractiveMode {
 					onFullscreenScrollbarChange: (mode) => {
 						this.settingsManager.setFullscreenScrollbar(mode);
 						this.applyFullscreenScrollbarSetting();
+					},
+					onFullscreenCopyOnSelectChange: (enabled) => {
+						this.settingsManager.setFullscreenCopyOnSelect(enabled);
+						if (this.renderer instanceof TuiAltScreen) this.renderer.setCopyOnSelect(enabled);
 					},
 					onWarningsChange: (warnings) => {
 						this.settingsManager.setWarnings(warnings);
@@ -5953,7 +5965,17 @@ export class InteractiveMode {
 		}
 	}
 
-	private async handleCopyCommand(options: { flashConfirmation?: boolean } = {}): Promise<void> {
+	private async handleCopyCommand(
+		options: { flashConfirmation?: boolean; preferFullscreenSelection?: boolean } = {},
+	): Promise<void> {
+		if (
+			options.preferFullscreenSelection &&
+			this.renderer instanceof TuiAltScreen &&
+			this.renderer.copyActiveSelectionToClipboard()
+		) {
+			return;
+		}
+
 		const text = this.session.getLastAssistantText();
 		if (!text) {
 			this.showError("No agent messages to copy yet.");
@@ -5962,8 +5984,8 @@ export class InteractiveMode {
 
 		try {
 			await copyToClipboard(text);
-			if (options.flashConfirmation && this.ui instanceof TuiAltScreen) {
-				this.ui.flash("Copied!");
+			if (options.flashConfirmation && this.renderer instanceof TuiAltScreen) {
+				this.renderer.flash("Copied!");
 			} else {
 				this.showStatus("Copied last agent message to clipboard");
 			}
